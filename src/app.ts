@@ -4,7 +4,7 @@ import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import { connectDB } from './config/database';
 import { connectRedis } from './config/redis';
-import { config } from './config/config';
+import { config } from './config/env';
 
 // Routes
 import authRoutes from './routes/authRoutes';

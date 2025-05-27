@@ -1,408 +1,792 @@
-import { Response } from 'express';
-import { Favorite } from '../models/Favorite';
+import { Request, Response, NextFunction } from 'express';
+import { Favorite, IFavorite } from '../models/Favorite';
 import { Property } from '../models/Property';
-import { AuthRequest } from '../types';
-import { CacheService } from '../services/cacheService';
-import { isValidObjectId } from '../utils/helpers';
+import { User } from '../models/User';
+import { redisClient } from '../config/redis';
+import { config, CACHE_KEYS } from '../config/env';
+import mongoose from 'mongoose';
 
-export const favoriteController = {
-  // Add property to favorites
-  add: async (req: AuthRequest, res: Response) => {
+// Interface for query parameters
+interface FavoriteQueryParams {
+  page?: string;
+  limit?: string;
+  sortBy?: string;
+  sortOrder?: 'asc' | 'desc';
+  favoriteType?: 'interested' | 'watchlist' | 'shortlisted' | 'considering';
+  priority?: 'low' | 'medium' | 'high';
+  tags?: string;
+  hasReminder?: string;
+  priceChanged?: string;
+}
+
+export class FavoriteController {
+
+  // Get user's favorites
+  static async getFavorites(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const { propertyId } = req.body;
-      
-      if (!propertyId) {
-        return res.status(400).json({ error: 'Property ID is required' });
+      if (!req.user) {
+        res.status(401).json({
+          success: false,
+          message: 'Authentication required',
+          error: 'UNAUTHORIZED'
+        });
+        return;
       }
 
-      // Validate ObjectId format
-      if (!isValidObjectId(propertyId)) {
-        return res.status(400).json({ error: 'Invalid property ID format' });
+      const {
+        page = '1',
+        limit = config.DEFAULT_PAGE_SIZE.toString(),
+        sortBy = 'createdAt',
+        sortOrder = 'desc',
+        favoriteType,
+        priority,
+        tags,
+        hasReminder,
+        priceChanged
+      } = req.query as FavoriteQueryParams;
+
+      const pageNum = Math.max(1, parseInt(page));
+      const limitNum = Math.min(parseInt(limit), config.MAX_PAGE_SIZE);
+      const skip = (pageNum - 1) * limitNum;
+
+      // Build filter query
+      const filter: any = { userId: req.user._id };
+
+      if (favoriteType) {
+        filter.favoriteType = favoriteType;
       }
 
-      // Check if property exists
+      if (priority) {
+        filter.priority = priority;
+      }
+
+      if (tags) {
+        const tagsArray = tags.split(',').map(t => t.trim().toLowerCase());
+        filter.tags = { $in: tagsArray };
+      }
+
+      if (hasReminder === 'true') {
+        filter.reminderDate = { $exists: true, $ne: null };
+      }
+
+      // Build sort object
+      const sortOptions: any = {};
+      if (sortBy === 'price') {
+        // This will require population to sort by property price
+        sortOptions.createdAt = sortOrder === 'asc' ? 1 : -1;
+      } else if (sortBy === 'priority') {
+        // Custom priority sorting: high -> medium -> low
+        const priorityOrder = { high: 3, medium: 2, low: 1 };
+        sortOptions.priority = sortOrder === 'asc' ? 1 : -1;
+      } else {
+        sortOptions[sortBy] = sortOrder === 'asc' ? 1 : -1;
+      }
+
+      // Check cache first
+      const cacheKey = `${CACHE_KEYS.USER_FAVORITES}:${req.user._id}:${JSON.stringify({
+        filter,
+        sort: sortOptions,
+        page: pageNum,
+        limit: limitNum
+      })}`;
+
+      const cachedResult = await redisClient.getObject(cacheKey);
+      if (cachedResult) {
+        res.status(200).json(cachedResult);
+        return;
+      }
+
+      // Execute query with population
+      const [favorites, totalCount] = await Promise.all([
+        Favorite.find(filter)
+          .sort(sortOptions)
+          .skip(skip)
+          .limit(limitNum)
+          .populate({
+            path: 'propertyId',
+            select: 'id title type price location specifications amenities rating isVerified listingType media colorTheme',
+            match: { isActive: true } // Only populate active properties
+          })
+          .lean()
+          .exec(),
+        Favorite.countDocuments(filter)
+      ]);
+
+      // Filter out favorites where property was not populated (inactive properties)
+      const validFavorites = favorites.filter(fav => fav.propertyId);
+
+      // Check for price changes if requested
+      if (priceChanged === 'true') {
+        for (const favorite of validFavorites) {
+          const fav = await Favorite.findById(favorite._id);
+          if (fav) {
+            await fav.isPriceChanged();
+          }
+        }
+      }
+
+      // Calculate pagination
+      const totalPages = Math.ceil(totalCount / limitNum);
+
+      const result = {
+        success: true,
+        message: 'Favorites retrieved successfully',
+        data: {
+          favorites: validFavorites,
+          pagination: {
+            currentPage: pageNum,
+            totalPages,
+            totalCount,
+            limit: limitNum,
+            hasNextPage: pageNum < totalPages,
+            hasPrevPage: pageNum > 1
+          },
+          summary: {
+            totalFavorites: totalCount,
+            validFavorites: validFavorites.length,
+            byType: await Favorite.aggregate([
+              { $match: { userId: req.user._id } },
+              { $group: { _id: '$favoriteType', count: { $sum: 1 } } }
+            ]),
+            byPriority: await Favorite.aggregate([
+              { $match: { userId: req.user._id } },
+              { $group: { _id: '$priority', count: { $sum: 1 } } }
+            ])
+          }
+        }
+      };
+
+      // Cache the result
+      await redisClient.set(cacheKey, JSON.stringify(result), config.CACHE_TTL_SHORT);
+
+      res.status(200).json(result);
+
+    } catch (error: any) {
+      console.error('Get favorites error:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Failed to retrieve favorites',
+        error: 'INTERNAL_SERVER_ERROR'
+      });
+    }
+  }
+
+  // Add property to favorites
+  static async addToFavorites(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const { propertyId } = req.params;
+      const {
+        notes,
+        tags = [],
+        favoriteType = 'interested',
+        priority = 'medium',
+        reminderDate,
+        addedFromPage = 'other'
+      } = req.body;
+
+      if (!req.user) {
+        res.status(401).json({
+          success: false,
+          message: 'Authentication required',
+          error: 'UNAUTHORIZED'
+        });
+        return;
+      }
+
+      if (!mongoose.Types.ObjectId.isValid(propertyId)) {
+        res.status(400).json({
+          success: false,
+          message: 'Invalid property ID format',
+          error: 'INVALID_PROPERTY_ID'
+        });
+        return;
+      }
+
+      // Check if property exists and is active
       const property = await Property.findById(propertyId);
-      if (!property) {
-        return res.status(404).json({ error: 'Property not found' });
+      if (!property || !property.isActive) {
+        res.status(404).json({
+          success: false,
+          message: 'Property not found or not available',
+          error: 'PROPERTY_NOT_FOUND'
+        });
+        return;
       }
 
-      // Check if already in favorites
+      // Check if already favorited
       const existingFavorite = await Favorite.findOne({
-        userId: req.user!._id,
+        userId: req.user._id,
         propertyId
       });
 
       if (existingFavorite) {
-        return res.status(400).json({ error: 'Property already in favorites' });
+        res.status(409).json({
+          success: false,
+          message: 'Property is already in your favorites',
+          error: 'ALREADY_FAVORITED',
+          data: {
+            favorite: existingFavorite.toJSON()
+          }
+        });
+        return;
       }
 
       // Create new favorite
-      const favorite = new Favorite({
-        userId: req.user!._id,
-        propertyId
-      });
+      const favoriteData: any = {
+        userId: req.user._id,
+        propertyId,
+        notes: notes?.trim(),
+        tags: Array.isArray(tags) ? tags.map((t: string) => t.trim().toLowerCase()) : [],
+        favoriteType,
+        priority,
+        metadata: {
+          addedFromPage,
+          priceWhenAdded: property.price
+        }
+      };
 
+      if (reminderDate) {
+        favoriteData.reminderDate = new Date(reminderDate);
+      }
+
+      const favorite = new Favorite(favoriteData);
       await favorite.save();
 
-      // Clear user's favorites cache
-      await CacheService.del(`favorites:${req.user!._id}`);
+      // Clear user favorites cache
+      await redisClient.deletePattern(`${CACHE_KEYS.USER_FAVORITES}:${req.user._id}:*`);
 
-      // Populate property details for response
-      await favorite.populate('propertyId', 'title type price city state listingType');
+      // Populate for response
+      await favorite.populate('propertyId', 'id title type price location rating');
 
       res.status(201).json({
+        success: true,
         message: 'Property added to favorites successfully',
-        favorite
+        data: {
+          favorite: favorite.toJSON()
+        }
       });
-    } catch (error) {
+
+    } catch (error: any) {
       console.error('Add to favorites error:', error);
-      res.status(500).json({ error: 'Internal server error' });
+      
+      if (error.name === 'ValidationError') {
+        const validationErrors = Object.values(error.errors).map((err: any) => err.message);
+        res.status(400).json({
+          success: false,
+          message: 'Validation failed',
+          errors: validationErrors
+        });
+        return;
+      }
+
+      res.status(500).json({
+        success: false,
+        message: 'Failed to add property to favorites',
+        error: 'INTERNAL_SERVER_ERROR'
+      });
     }
-  },
+  }
 
   // Remove property from favorites
-  remove: async (req: AuthRequest, res: Response) => {
+  static async removeFromFavorites(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
       const { propertyId } = req.params;
 
-      if (!propertyId) {
-        return res.status(400).json({ error: 'Property ID is required' });
+      if (!req.user) {
+        res.status(401).json({
+          success: false,
+          message: 'Authentication required',
+          error: 'UNAUTHORIZED'
+        });
+        return;
       }
 
-      // Validate ObjectId format
-      if (!isValidObjectId(propertyId)) {
-        return res.status(400).json({ error: 'Invalid property ID format' });
+      if (!mongoose.Types.ObjectId.isValid(propertyId)) {
+        res.status(400).json({
+          success: false,
+          message: 'Invalid property ID format',
+          error: 'INVALID_PROPERTY_ID'
+        });
+        return;
       }
 
       // Find and remove favorite
-      const favorite = await Favorite.findOne({
-        userId: req.user!._id,
+      const favorite = await Favorite.findOneAndDelete({
+        userId: req.user._id,
         propertyId
       });
 
       if (!favorite) {
-        return res.status(404).json({ error: 'Property not found in favorites' });
+        res.status(404).json({
+          success: false,
+          message: 'Favorite not found',
+          error: 'FAVORITE_NOT_FOUND'
+        });
+        return;
       }
 
-      await Favorite.findByIdAndDelete(favorite._id);
+      // Clear user favorites cache
+      await redisClient.deletePattern(`${CACHE_KEYS.USER_FAVORITES}:${req.user._id}:*`);
 
-      // Clear user's favorites cache
-      await CacheService.del(`favorites:${req.user!._id}`);
-
-      res.json({ 
-        message: 'Property removed from favorites successfully',
-        propertyId 
+      res.status(200).json({
+        success: true,
+        message: 'Property removed from favorites successfully'
       });
-    } catch (error) {
+
+    } catch (error: any) {
       console.error('Remove from favorites error:', error);
-      res.status(500).json({ error: 'Internal server error' });
+      res.status(500).json({
+        success: false,
+        message: 'Failed to remove property from favorites',
+        error: 'INTERNAL_SERVER_ERROR'
+      });
     }
-  },
+  }
 
-  // Get all user favorites
-  getAll: async (req: AuthRequest, res: Response) => {
+  // Update favorite details
+  static async updateFavorite(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const page = parseInt(req.query.page as string) || 1;
-      const limit = parseInt(req.query.limit as string) || 10;
-      const skip = (page - 1) * limit;
+      const { favoriteId } = req.params;
+      const updateData = req.body;
 
-      // Validate pagination parameters
-      if (page < 1 || limit < 1 || limit > 100) {
-        return res.status(400).json({ error: 'Invalid pagination parameters' });
+      if (!req.user) {
+        res.status(401).json({
+          success: false,
+          message: 'Authentication required',
+          error: 'UNAUTHORIZED'
+        });
+        return;
       }
 
-      // Check cache first
-      const cacheKey = `favorites:${req.user!._id}:page:${page}:limit:${limit}`;
-      const cachedFavorites = await CacheService.get(cacheKey);
-      
-      if (cachedFavorites) {
-        return res.json(cachedFavorites);
+      if (!mongoose.Types.ObjectId.isValid(favoriteId)) {
+        res.status(400).json({
+          success: false,
+          message: 'Invalid favorite ID format',
+          error: 'INVALID_FAVORITE_ID'
+        });
+        return;
       }
 
-      // Get favorites with property details
-      const favorites = await Favorite.find({ userId: req.user!._id })
-        .populate({
-          path: 'propertyId',
-          select: 'id title type price state city areaSqFt bedrooms bathrooms furnished listingType rating isVerified colorTheme availableFrom createdAt',
-          populate: {
-            path: 'createdBy',
-            select: 'firstName lastName email'
-          }
-        })
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(limit);
+      // Find favorite
+      const favorite = await Favorite.findOne({
+        _id: favoriteId,
+        userId: req.user._id
+      });
 
-      // Filter out favorites where property might have been deleted
-      const validFavorites = favorites.filter(fav => fav.propertyId);
+      if (!favorite) {
+        res.status(404).json({
+          success: false,
+          message: 'Favorite not found',
+          error: 'FAVORITE_NOT_FOUND'
+        });
+        return;
+      }
 
-      const total = await Favorite.countDocuments({ userId: req.user!._id });
+      // Allowed update fields
+      const allowedUpdates = ['notes', 'tags', 'favoriteType', 'priority', 'reminderDate', 'isNotificationEnabled'];
+      const updates = Object.keys(updateData);
+      const isValidOperation = updates.every(update => allowedUpdates.includes(update));
 
-      const result = {
-        favorites: validFavorites,
-        pagination: {
-          page,
-          limit,
-          total,
-          pages: Math.ceil(total / limit),
-          hasNextPage: page < Math.ceil(total / limit),
-          hasPrevPage: page > 1
+      if (!isValidOperation) {
+        res.status(400).json({
+          success: false,
+          message: 'Invalid updates attempted',
+          error: 'INVALID_UPDATES'
+        });
+        return;
+      }
+
+      // Apply updates
+      updates.forEach(update => {
+        if (update === 'tags' && Array.isArray(updateData[update])) {
+          (favorite as any)[update] = updateData[update].map((t: string) => t.trim().toLowerCase());
+        } else if (update === 'reminderDate' && updateData[update]) {
+          (favorite as any)[update] = new Date(updateData[update]);
+        } else {
+          (favorite as any)[update] = updateData[update];
         }
-      };
+      });
 
-      // Cache the result for 5 minutes
-      await CacheService.set(cacheKey, result, 300);
+      await favorite.save();
 
-      res.json(result);
-    } catch (error) {
-      console.error('Get favorites error:', error);
-      res.status(500).json({ error: 'Internal server error' });
-    }
-  },
+      // Clear user favorites cache
+      await redisClient.deletePattern(`${CACHE_KEYS.USER_FAVORITES}:${req.user._id}:*`);
 
-  // Check if property is in user's favorites
-  checkFavorite: async (req: AuthRequest, res: Response) => {
-    try {
-      const { propertyId } = req.params;
+      // Populate for response
+      await favorite.populate('propertyId', 'id title type price location rating');
 
-      if (!propertyId) {
-        return res.status(400).json({ error: 'Property ID is required' });
+      res.status(200).json({
+        success: true,
+        message: 'Favorite updated successfully',
+        data: {
+          favorite: favorite.toJSON()
+        }
+      });
+
+    } catch (error: any) {
+      console.error('Update favorite error:', error);
+      
+      if (error.name === 'ValidationError') {
+        const validationErrors = Object.values(error.errors).map((err: any) => err.message);
+        res.status(400).json({
+          success: false,
+          message: 'Validation failed',
+          errors: validationErrors
+        });
+        return;
       }
 
-      // Validate ObjectId format
-      if (!isValidObjectId(propertyId)) {
-        return res.status(400).json({ error: 'Invalid property ID format' });
+      res.status(500).json({
+        success: false,
+        message: 'Failed to update favorite',
+        error: 'INTERNAL_SERVER_ERROR'
+      });
+    }
+  }
+
+  // Get single favorite details
+  static async getFavoriteById(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const { favoriteId } = req.params;
+
+      if (!req.user) {
+        res.status(401).json({
+          success: false,
+          message: 'Authentication required',
+          error: 'UNAUTHORIZED'
+        });
+        return;
+      }
+
+      if (!mongoose.Types.ObjectId.isValid(favoriteId)) {
+        res.status(400).json({
+          success: false,
+          message: 'Invalid favorite ID format',
+          error: 'INVALID_FAVORITE_ID'
+        });
+        return;
       }
 
       const favorite = await Favorite.findOne({
-        userId: req.user!._id,
-        propertyId
-      });
+        _id: favoriteId,
+        userId: req.user._id
+      })
+      .populate('propertyId')
+      .exec();
 
-      res.json({
-        isFavorite: !!favorite,
-        favoriteId: favorite?._id || null
-      });
-    } catch (error) {
-      console.error('Check favorite error:', error);
-      res.status(500).json({ error: 'Internal server error' });
-    }
-  },
-
-  // Get favorite statistics for user
-  getStats: async (req: AuthRequest, res: Response) => {
-    try {
-      const cacheKey = `favorite_stats:${req.user!._id}`;
-      const cachedStats = await CacheService.get(cacheKey);
-      
-      if (cachedStats) {
-        return res.json(cachedStats);
-      }
-
-      // Get total favorites count
-      const totalFavorites = await Favorite.countDocuments({ userId: req.user!._id });
-
-      // Get favorites by property type
-      const favoritesByType = await Favorite.aggregate([
-        { $match: { userId: req.user!._id } },
-        {
-          $lookup: {
-            from: 'properties',
-            localField: 'propertyId',
-            foreignField: '_id',
-            as: 'property'
-          }
-        },
-        { $unwind: '$property' },
-        {
-          $group: {
-            _id: '$property.type',
-            count: { $sum: 1 }
-          }
-        },
-        {
-          $project: {
-            type: '$_id',
-            count: 1,
-            _id: 0
-          }
-        }
-      ]);
-
-      // Get favorites by listing type
-      const favoritesByListingType = await Favorite.aggregate([
-        { $match: { userId: req.user!._id } },
-        {
-          $lookup: {
-            from: 'properties',
-            localField: 'propertyId',
-            foreignField: '_id',
-            as: 'property'
-          }
-        },
-        { $unwind: '$property' },
-        {
-          $group: {
-            _id: '$property.listingType',
-            count: { $sum: 1 }
-          }
-        },
-        {
-          $project: {
-            listingType: '$_id',
-            count: 1,
-            _id: 0
-          }
-        }
-      ]);
-
-      // Get recent favorites (last 5)
-      const recentFavorites = await Favorite.find({ userId: req.user!._id })
-        .populate('propertyId', 'title type price city state listingType')
-        .sort({ createdAt: -1 })
-        .limit(5);
-
-      const stats = {
-        totalFavorites,
-        favoritesByType,
-        favoritesByListingType,
-        recentFavorites: recentFavorites.filter(fav => fav.propertyId)
-      };
-
-      // Cache stats for 10 minutes
-      await CacheService.set(cacheKey, stats, 600);
-
-      res.json(stats);
-    } catch (error) {
-      console.error('Get favorite stats error:', error);
-      res.status(500).json({ error: 'Internal server error' });
-    }
-  },
-
-  // Bulk add properties to favorites
-  bulkAdd: async (req: AuthRequest, res: Response) => {
-    try {
-      const { propertyIds } = req.body;
-
-      if (!propertyIds || !Array.isArray(propertyIds) || propertyIds.length === 0) {
-        return res.status(400).json({ error: 'Property IDs array is required' });
-      }
-
-      if (propertyIds.length > 50) {
-        return res.status(400).json({ error: 'Cannot add more than 50 properties at once' });
-      }
-
-      // Validate all property IDs
-      for (const id of propertyIds) {
-        if (!isValidObjectId(id)) {
-          return res.status(400).json({ error: `Invalid property ID format: ${id}` });
-        }
-      }
-
-      // Check which properties exist
-      const existingProperties = await Property.find({
-        _id: { $in: propertyIds }
-      }).select('_id');
-
-      const existingPropertyIds = existingProperties.map(p => p._id.toString());
-      const invalidIds = propertyIds.filter(id => !existingPropertyIds.includes(id));
-
-      if (invalidIds.length > 0) {
-        return res.status(404).json({ 
-          error: 'Some properties not found',
-          invalidIds 
+      if (!favorite) {
+        res.status(404).json({
+          success: false,
+          message: 'Favorite not found',
+          error: 'FAVORITE_NOT_FOUND'
         });
+        return;
       }
 
-      // Check which properties are already in favorites
-      const existingFavorites = await Favorite.find({
-        userId: req.user!._id,
-        propertyId: { $in: propertyIds }
-      }).select('propertyId');
+      // Update view count
+      await favorite.updateViewCount();
 
-      const alreadyFavoriteIds = existingFavorites.map(f => f.propertyId.toString());
-      const newFavoriteIds = propertyIds.filter(id => !alreadyFavoriteIds.includes(id));
+      // Check for price changes
+      const priceChanged = await favorite.isPriceChanged();
 
-      if (newFavoriteIds.length === 0) {
-        return res.status(400).json({ error: 'All properties are already in favorites' });
-      }
-
-      // Create new favorites
-      const newFavorites = newFavoriteIds.map(propertyId => ({
-        userId: req.user!._id,
-        propertyId
-      }));
-
-      const createdFavorites = await Favorite.insertMany(newFavorites);
-
-      // Clear user's favorites cache
-      await CacheService.delPattern(`favorites:${req.user!._id}*`);
-
-      res.status(201).json({
-        message: `${createdFavorites.length} properties added to favorites`,
-        addedCount: createdFavorites.length,
-        skippedCount: alreadyFavoriteIds.length,
-        alreadyFavoriteIds
-      });
-    } catch (error) {
-      console.error('Bulk add favorites error:', error);
-      res.status(500).json({ error: 'Internal server error' });
-    }
-  },
-
-  // Bulk remove properties from favorites
-  bulkRemove: async (req: AuthRequest, res: Response) => {
-    try {
-      const { propertyIds } = req.body;
-
-      if (!propertyIds || !Array.isArray(propertyIds) || propertyIds.length === 0) {
-        return res.status(400).json({ error: 'Property IDs array is required' });
-      }
-
-      if (propertyIds.length > 50) {
-        return res.status(400).json({ error: 'Cannot remove more than 50 properties at once' });
-      }
-
-      // Validate all property IDs
-      for (const id of propertyIds) {
-        if (!isValidObjectId(id)) {
-          return res.status(400).json({ error: `Invalid property ID format: ${id}` });
+      res.status(200).json({
+        success: true,
+        message: 'Favorite details retrieved successfully',
+        data: {
+          favorite: favorite.toJSON(),
+          insights: {
+            priceChanged,
+            daysSinceAdded: favorite.createdAt ? Math.floor((Date.now() - new Date(favorite.createdAt).getTime()) / (1000 * 60 * 60 * 24)) : null,
+            viewCount: favorite.metadata?.viewCount ?? null
+          }
         }
-      }
-
-      const result = await Favorite.deleteMany({
-        userId: req.user!._id,
-        propertyId: { $in: propertyIds }
       });
 
-      // Clear user's favorites cache
-      await CacheService.delPattern(`favorites:${req.user!._id}*`);
-
-      res.json({
-        message: `${result.deletedCount} properties removed from favorites`,
-        removedCount: result.deletedCount
+    } catch (error: any) {
+      console.error('Get favorite by ID error:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Failed to retrieve favorite details',
+        error: 'INTERNAL_SERVER_ERROR'
       });
-    } catch (error) {
-      console.error('Bulk remove favorites error:', error);
-      res.status(500).json({ error: 'Internal server error' });
-    }
-  },
-
-  // Clear all favorites for user
-  clearAll: async (req: AuthRequest, res: Response) => {
-    try {
-      const result = await Favorite.deleteMany({ userId: req.user!._id });
-
-      // Clear user's favorites cache
-      await CacheService.delPattern(`favorites:${req.user!._id}*`);
-
-      res.json({
-        message: 'All favorites cleared successfully',
-        removedCount: result.deletedCount
-      });
-    } catch (error) {
-      console.error('Clear all favorites error:', error);
-      res.status(500).json({ error: 'Internal server error' });
     }
   }
-};
+
+  // Check if property is favorited by user
+  static async checkFavoriteStatus(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const { propertyId } = req.params;
+
+      if (!req.user) {
+        res.status(401).json({
+          success: false,
+          message: 'Authentication required',
+          error: 'UNAUTHORIZED'
+        });
+        return;
+      }
+
+      if (!mongoose.Types.ObjectId.isValid(propertyId)) {
+        res.status(400).json({
+          success: false,
+          message: 'Invalid property ID format',
+          error: 'INVALID_PROPERTY_ID'
+        });
+        return;
+      }
+
+      const favorite = await Favorite.findOne({
+        userId: req.user._id,
+        propertyId
+      }).select('favoriteType priority createdAt').lean();
+
+      res.status(200).json({
+        success: true,
+        message: 'Favorite status retrieved successfully',
+        data: {
+          isFavorited: !!favorite,
+          favorite: favorite || null
+        }
+      });
+
+    } catch (error: any) {
+      console.error('Check favorite status error:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Failed to check favorite status',
+        error: 'INTERNAL_SERVER_ERROR'
+      });
+    }
+  }
+
+  // Add tag to favorite
+  static async addTag(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const { favoriteId } = req.params;
+      const { tag } = req.body;
+
+      if (!req.user) {
+        res.status(401).json({
+          success: false,
+          message: 'Authentication required',
+          error: 'UNAUTHORIZED'
+        });
+        return;
+      }
+
+      if (!tag || typeof tag !== 'string') {
+        res.status(400).json({
+          success: false,
+          message: 'Tag is required and must be a string',
+          error: 'INVALID_TAG'
+        });
+        return;
+      }
+
+      const favorite = await Favorite.findOne({
+        _id: favoriteId,
+        userId: req.user._id
+      });
+
+      if (!favorite) {
+        res.status(404).json({
+          success: false,
+          message: 'Favorite not found',
+          error: 'FAVORITE_NOT_FOUND'
+        });
+        return;
+      }
+
+      await favorite.addTag(tag);
+
+      // Clear cache
+      await redisClient.deletePattern(`${CACHE_KEYS.USER_FAVORITES}:${req.user._id}:*`);
+
+      res.status(200).json({
+        success: true,
+        message: 'Tag added successfully',
+        data: {
+          tags: favorite.tags
+        }
+      });
+
+    } catch (error: any) {
+      console.error('Add tag error:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Failed to add tag',
+        error: 'INTERNAL_SERVER_ERROR'
+      });
+    }
+  }
+
+  // Remove tag from favorite
+  static async removeTag(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const { favoriteId } = req.params;
+      const { tag } = req.body;
+
+      if (!req.user) {
+        res.status(401).json({
+          success: false,
+          message: 'Authentication required',
+          error: 'UNAUTHORIZED'
+        });
+        return;
+      }
+
+      if (!tag || typeof tag !== 'string') {
+        res.status(400).json({
+          success: false,
+          message: 'Tag is required and must be a string',
+          error: 'INVALID_TAG'
+        });
+        return;
+      }
+
+      const favorite = await Favorite.findOne({
+        _id: favoriteId,
+        userId: req.user._id
+      });
+
+      if (!favorite) {
+        res.status(404).json({
+          success: false,
+          message: 'Favorite not found',
+          error: 'FAVORITE_NOT_FOUND'
+        });
+        return;
+      }
+
+      await favorite.removeTag(tag);
+
+      // Clear cache
+      await redisClient.deletePattern(`${CACHE_KEYS.USER_FAVORITES}:${req.user._id}:*`);
+
+      res.status(200).json({
+        success: true,
+        message: 'Tag removed successfully',
+        data: {
+          tags: favorite.tags
+        }
+      });
+
+    } catch (error: any) {
+      console.error('Remove tag error:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Failed to remove tag',
+        error: 'INTERNAL_SERVER_ERROR'
+      });
+    }
+  }
+
+  // Get favorite analytics/insights
+  static async getFavoriteInsights(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      if (!req.user) {
+        res.status(401).json({
+          success: false,
+          message: 'Authentication required',
+          error: 'UNAUTHORIZED'
+        });
+        return;
+      }
+
+      const userId = req.user._id;
+
+      // Get comprehensive insights
+      const [
+        totalFavorites,
+        favoritesByType,
+        favoritesByPriority,
+        recentFavorites,
+        priceChanges,
+        popularTags,
+        upcomingReminders
+      ] = await Promise.all([
+        Favorite.countDocuments({ userId }),
+        
+        Favorite.aggregate([
+          { $match: { userId } },
+          { $group: { _id: '$favoriteType', count: { $sum: 1 } } }
+        ]),
+        
+        Favorite.aggregate([
+          { $match: { userId } },
+          { $group: { _id: '$priority', count: { $sum: 1 } } }
+        ]),
+        
+        Favorite.find({ userId })
+          .sort({ createdAt: -1 })
+          .limit(5)
+          .populate('propertyId', 'id title price location')
+          .lean(),
+          
+        // Properties with price changes (simplified)
+        Favorite.countDocuments({ 
+          userId, 
+          'metadata.priceChangeCount': { $gt: 0 } 
+        }),
+        
+        Favorite.aggregate([
+          { $match: { userId } },
+          { $unwind: '$tags' },
+          { $group: { _id: '$tags', count: { $sum: 1 } } },
+          { $sort: { count: -1 } },
+          { $limit: 10 }
+        ]),
+        
+        Favorite.find({
+          userId,
+          reminderDate: { 
+            $exists: true, 
+            $gte: new Date(),
+            $lte: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) // Next 7 days
+          }
+        })
+        .sort({ reminderDate: 1 })
+        .populate('propertyId', 'id title')
+        .limit(5)
+        .lean()
+      ]);
+
+      res.status(200).json({
+        success: true,
+        message: 'Favorite insights retrieved successfully',
+        data: {
+          overview: {
+            totalFavorites,
+            priceChanges,
+            upcomingReminders: upcomingReminders.length
+          },
+          distribution: {
+            byType: favoritesByType,
+            byPriority: favoritesByPriority
+          },
+          recent: {
+            favorites: recentFavorites,
+            count: recentFavorites.length
+          },
+          tags: {
+            popular: popularTags,
+            totalUniqueTags: popularTags.length
+          },
+          reminders: {
+            upcoming: upcomingReminders,
+            count: upcomingReminders.length
+          },
+          generatedAt: new Date().toISOString()
+        }
+      });
+
+    } catch (error: any) {
+      console.error('Get favorite insights error:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Failed to retrieve favorite insights',
+        error: 'INTERNAL_SERVER_ERROR'
+      });
+    }
+  }
+}
